@@ -106,16 +106,5 @@ st.dataframe(
     sens_df.style.applymap(color_rentabilidad)
     .format(lambda x: f"{x:,.1f}%" if isinstance(x, (int, float)) else x)
 )
-from flask import Flask
-import os
 
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "App funcionando correctamente en Render 🚀"
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Render asigna el puerto dinámicamente
-    app.run(host="0.0.0.0", port=port)
 
