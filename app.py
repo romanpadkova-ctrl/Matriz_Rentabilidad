@@ -3,8 +3,7 @@ import io
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date, datetime
-from datetime import timezone
+from datetime import date, datetime, timezone
 
 st.set_page_config(page_title="Suite Comercial", page_icon="📊", layout="wide")
 
@@ -106,7 +105,8 @@ def save_alert(payload: dict):
                     """INSERT INTO alerts
                        (ts, cultivo, acopio, cliente, comercial, producto, posicion,
                         precio_objetivo, precio_spot, rinde, hectareas)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);""",
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       RETURNING id;""",
                     (
                         payload["ts"], payload["cultivo"], payload["acopio"],
                         payload["cliente"], payload["comercial"], payload["producto"],
@@ -114,6 +114,7 @@ def save_alert(payload: dict):
                         payload["precio_spot"], payload["rinde"], payload["hectareas"]
                     )
                 )
+                _new_id = cur.fetchone()[0]
                 conn.commit()
             conn.close()
             return ("db", None)
@@ -130,39 +131,81 @@ def save_alert(payload: dict):
         csv_path = "alerts.csv"
         if os.path.exists(csv_path):
             df_old = pd.read_csv(csv_path)
+            # emular ID autoincremental simple para CSV
+            next_id = (df_old.get("id").max() + 1) if "id" in df_old.columns and not df_old.empty else 1
+            df_row.insert(0, "id", next_id)
             df = pd.concat([df_old, df_row], ignore_index=True)
         else:
+            df_row.insert(0, "id", 1)
             df = df_row
         df.to_csv(csv_path, index=False)
         return ("csv", csv_path)
     except Exception as e:
         return ("csv_error", str(e))
 
-def fetch_alerts_df():
+def load_alerts():
     """
-    Lee alertas desde Postgres o CSV.
-    Devuelve (df, origen) donde origen ∈ {"db","csv","empty","error"}.
+    Carga alertas desde Postgres o CSV. Devuelve (origen, df) donde origen ∈ {"db","csv"}.
     """
     conn = get_db_conn()
     if conn:
         try:
             init_db(conn)
-            df = pd.read_sql_query("SELECT * FROM alerts ORDER BY ts DESC;", conn)
+            df = pd.read_sql_query("SELECT * FROM alerts ORDER BY id DESC;", conn)
             conn.close()
-            return (df, "db") if not df.empty else (df, "empty")
+            return ("db", df)
         except Exception as e:
-            return (pd.DataFrame(), f"error: {e}")
-
+            try:
+                conn.close()
+            except:
+                pass
+            st.warning(f"No pude leer Postgres ({e}). Intento CSV.")
     # CSV
     csv_path = "alerts.csv"
     if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        return ("csv", df)
+    return ("csv", pd.DataFrame())
+
+def delete_alerts_by_ids(id_list):
+    """
+    Borra por IDs (lista de ints). Soporta Postgres y CSV.
+    """
+    if not id_list:
+        return ("none", 0, None)
+
+    conn = get_db_conn()
+    if conn:
         try:
-            df = pd.read_csv(csv_path)
-            return (df, "csv") if not df.empty else (df, "empty")
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM alerts WHERE id = ANY(%s);", (id_list,))
+                deleted = cur.rowcount
+                conn.commit()
+            conn.close()
+            return ("db", deleted, None)
         except Exception as e:
-            return (pd.DataFrame(), f"error: {e}")
-    else:
-        return (pd.DataFrame(), "empty")
+            try:
+                conn.close()
+            except:
+                pass
+            return ("db_error", 0, str(e))
+
+    # CSV
+    try:
+        csv_path = "alerts.csv"
+        if not os.path.exists(csv_path):
+            return ("csv", 0, None)
+        df = pd.read_csv(csv_path)
+        if "id" not in df.columns or df.empty:
+            return ("csv", 0, None)
+        before = len(df)
+        df = df[~df["id"].isin(id_list)]
+        after = len(df)
+        deleted = before - after
+        df.to_csv(csv_path, index=False)
+        return ("csv", deleted, None)
+    except Exception as e:
+        return ("csv_error", 0, str(e))
 
 # =========================
 # Selector principal
@@ -233,36 +276,60 @@ if herramienta == "🏠 Home":
     """)
     st.info("Usá el menú lateral para entrar a *Financiación de insumos (ARS)*.")
 
-    # ===== Admin oculto con PIN para exportar alertas =====
+    # ---------- Admin oculto ----------
     st.markdown("---")
     with st.expander("🔐 Admin"):
-        ADMIN_PIN = os.environ.get("ADMIN_PIN", "1234")  # configurá ADMIN_PIN en Render; fallback 1234
-        pin_ingresado = st.text_input("PIN de administrador", type="password")
-        if pin_ingresado:
-            if pin_ingresado == ADMIN_PIN:
-                st.success("Acceso concedido.")
-                df_alertas, origen = fetch_alerts_df()
-                if isinstance(origen, str) and origen.startswith("error"):
-                    st.error(f"No pude leer las alertas ({origen}).")
-                elif df_alertas.empty:
-                    st.info("No hay alertas registradas todavía.")
-                else:
-                    st.caption(f"Origen de datos: **{origen}**")
-                    st.dataframe(df_alertas, use_container_width=True, height=300)
+        admin_pin_env = os.environ.get("ADMIN_PIN", "").strip()
+        pin_in = st.text_input("PIN de administrador", type="password")
+        if admin_pin_env and pin_in == admin_pin_env:
+            st.success("Acceso concedido.")
+            origen, df_alertas = load_alerts()
+            st.caption(f"Origen de datos: **{origen}**")
 
-                    # Exportar a Excel
+            # Mostrar resumen
+            if df_alertas is not None and not df_alertas.empty:
+                st.markdown("**Vista rápida de alertas (últimas 200):**")
+                st.dataframe(df_alertas.head(200))
+
+                # --- Botón Descargar Excel (FIX TZ) ---
+                if st.button("⬇️ Descargar alertas en Excel"):
+                    # FIX universal: quitar tz antes de exportar para evitar crash en Excel
+                    if "ts" in df_alertas.columns:
+                        df_alertas["ts"] = pd.to_datetime(
+                            df_alertas["ts"], errors="coerce", utc=True
+                        ).dt.tz_localize(None)
+
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                         df_alertas.to_excel(writer, index=False, sheet_name="alertas")
-                    buffer.seek(0)
                     st.download_button(
-                        "⬇️ Descargar alertas (.xlsx)",
-                        data=buffer,
-                        file_name=f"alertas_{date.today()}.xlsx",
+                        label="Descargar archivo .xlsx",
+                        data=buffer.getvalue(),
+                        file_name=f"alertas_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary"
+                        use_container_width=True
                     )
+
+                # --- Borrado por ID(s) ---
+                st.markdown("### 🗑️ Borrar alertas por ID")
+                ids_str = st.text_input("IDs a borrar (separados por coma)", placeholder="Ej: 12, 15, 19")
+                if st.button("Borrar seleccionadas"):
+                    try:
+                        id_list = [int(x.strip()) for x in ids_str.split(",") if x.strip().isdigit()]
+                    except:
+                        id_list = []
+                    if not id_list:
+                        st.warning("Ingresá al menos un ID válido.")
+                    else:
+                        where, deleted, err = delete_alerts_by_ids(id_list)
+                        if err:
+                            st.error(f"Error al borrar: {err}")
+                        else:
+                            st.success(f"Eliminadas {deleted} alerta(s) en {where}. Volvé a abrir el Admin para refrescar la vista.")
             else:
+                st.info("No hay alertas cargadas todavía.")
+        else:
+            if pin_in:
                 st.error("PIN incorrecto.")
 
 # =========================================================
@@ -364,34 +431,6 @@ elif herramienta == "📊 Matriz de rentabilidad":
         st.markdown(f"""<div class="card"><h3>Costo de Cultivo <span class="help" title="Insumos + Labores + Admin/Seguros (sin alquiler ni GC).">ℹ️</span></h3>
         <div class="value">{fmt_ars(costo_cultivo_ha)} USD/ha</div></div>""", unsafe_allow_html=True)
 
-    # Desglose
-    st.markdown("### Desglose de Costos")
-    st.markdown(f"""
-    <div class="costs">
-      <div class="title">INSUMOS</div>
-      <div class="row"><span>Agroquímicos</span><span>{fmt_ars(ins_agro)} USD/ha</span></div>
-      <div class="row"><span>Semillas</span><span>{fmt_ars(ins_semillas)} USD/ha</span></div>
-      <div class="row"><span>Fertilizantes</span><span>{fmt_ars(ins_fert)} USD/ha</span></div>
-
-      <div class="title" style="margin-top:10px;">LABORES</div>
-      <div class="row"><span>Fumigación</span><span>{fmt_ars(lab_fumi)} USD/ha</span></div>
-      <div class="row"><span>Siembra</span><span>{fmt_ars(lab_siembra)} USD/ha</span></div>
-      <div class="row"><span>Cosecha</span><span>{fmt_ars(lab_cosecha)} USD/ha</span></div>
-
-      <div class="title" style="margin-top:10px;">COMERCIALIZACIÓN</div>
-      <div class="row"><span>Gastos comerciales</span><span>{fmt_ars(gtos_comerc_ha)} USD/ha <span style="opacity:.7">(= {fmt_ars(gtos_comerc_tn)} USD/TN × {ton_ha:.2f} tn/ha)</span></span></div>
-
-      <div class="title" style="margin-top:10px;">ALQUILER</div>
-      <div class="row"><span>Alquiler</span><span>{alq_qq_ha:,.2f} qq/ha</span></div>
-      <div class="row"><span>Precio ref. soja alquiler</span><span>{fmt_ars(precio_soja_alq)} USD/t</span></div>
-      <div class="row"><span>Alquiler (USD/ha)</span><span>{fmt_ars(alq_usd_ha)} USD/ha</span></div>
-
-      <div class="row total"><span>Costo de cultivo (sin GC ni alquiler)</span><span>{fmt_ars(costo_cultivo_ha)} USD/ha</span></div>
-      <div class="row"><span>Inversión (costo cultivo + GC)</span><span>{fmt_ars(inversion_ha)} USD/ha</span></div>
-      <div class="row"><span>Costo total (incluye alquiler)</span><span>{fmt_ars(costo_total_ha)} USD/ha</span></div>
-    </div>
-    """, unsafe_allow_html=True)
-
     # ====== Formulario de Alertas ======
     st.markdown("### 📬 Enviar alerta comercial")
     with st.form("form_alerta"):
@@ -418,6 +457,7 @@ elif herramienta == "📊 Matriz de rentabilidad":
             st.error("Completá todos los campos del formulario de alerta.")
         else:
             payload = {
+                # guardamos con tz (UTC) para consistencia; al exportar quitamos tz
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "cultivo": cultivo,
                 "acopio": acopio.strip(),
@@ -438,7 +478,7 @@ elif herramienta == "📊 Matriz de rentabilidad":
             else:
                 st.error(f"❌ No pude guardar la alerta ({info}).")
 
-    # Sensibilidad
+    # ====== Sensibilidad ======
     if "sens_step_rinde" not in st.session_state:
         st.session_state.sens_step_rinde = 2.0
     if "sens_step_precio" not in st.session_state:
@@ -636,7 +676,7 @@ else:
 
     c3, c4 = st.columns(2)
     with c3:
-        # TNA grande y debajo tasa real del período
+        # TNA principal grande + detalle del período
         st.markdown(
             f"""<div class="card"><h3>TNA del negocio completo <span class="help" title="TNA equivalente de todo el negocio (financiación en USD + pesificación) para el período analizado.">ℹ️</span></h3>
             <div class="value">{tna_equiv_total*100:,.2f}%</div>
