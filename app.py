@@ -1,7 +1,10 @@
+import os
+import io
 import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import date, datetime
+from datetime import timezone
 
 st.set_page_config(page_title="Suite Comercial", page_icon="📊", layout="wide")
 
@@ -47,6 +50,119 @@ def unique_str_labels(vals, fmt_func):
             seen[lab] = 0
             out.append(lab)
     return out
+
+# =========================
+# DB helpers (Postgres con fallback a CSV)
+# =========================
+def get_db_conn():
+    """Devuelve conexión psycopg2 o None si no hay DATABASE_URL."""
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        return None
+    try:
+        import psycopg2
+        conn = psycopg2.connect(url)
+        return conn
+    except Exception as e:
+        st.warning(f"No pude conectar a Postgres ({e}). Uso CSV local.")
+        return None
+
+def init_db(conn):
+    """Crea tabla si no existe."""
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+              id SERIAL PRIMARY KEY,
+              ts TIMESTAMPTZ NOT NULL,
+              cultivo TEXT,
+              acopio TEXT,
+              cliente TEXT,
+              comercial TEXT,
+              producto TEXT,
+              posicion TEXT,
+              precio_objetivo NUMERIC,
+              precio_spot NUMERIC,
+              rinde NUMERIC,
+              hectareas NUMERIC
+            );
+            """)
+            conn.commit()
+    except Exception as e:
+        st.warning(f"No pude inicializar la tabla en Postgres: {e}")
+
+def save_alert(payload: dict):
+    """
+    Guarda en Postgres si hay DB; si no, en CSV local 'alerts.csv'.
+    """
+    conn = get_db_conn()
+    if conn:
+        try:
+            init_db(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO alerts
+                       (ts, cultivo, acopio, cliente, comercial, producto, posicion,
+                        precio_objetivo, precio_spot, rinde, hectareas)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);""",
+                    (
+                        payload["ts"], payload["cultivo"], payload["acopio"],
+                        payload["cliente"], payload["comercial"], payload["producto"],
+                        payload["posicion"], payload["precio_objetivo"],
+                        payload["precio_spot"], payload["rinde"], payload["hectareas"]
+                    )
+                )
+                conn.commit()
+            conn.close()
+            return ("db", None)
+        except Exception as e:
+            try:
+                conn.close()
+            except:
+                pass
+            return ("db_error", str(e))
+
+    # Fallback CSV
+    try:
+        df_row = pd.DataFrame([payload])
+        csv_path = "alerts.csv"
+        if os.path.exists(csv_path):
+            df_old = pd.read_csv(csv_path)
+            df = pd.concat([df_old, df_row], ignore_index=True)
+        else:
+            df = df_row
+        df.to_csv(csv_path, index=False)
+        return ("csv", csv_path)
+    except Exception as e:
+        return ("csv_error", str(e))
+
+def fetch_alerts_df():
+    """
+    Lee alertas desde Postgres o CSV.
+    Devuelve (df, origen) donde origen ∈ {"db","csv","empty","error"}.
+    """
+    conn = get_db_conn()
+    if conn:
+        try:
+            init_db(conn)
+            df = pd.read_sql_query("SELECT * FROM alerts ORDER BY ts DESC;", conn)
+            conn.close()
+            return (df, "db") if not df.empty else (df, "empty")
+        except Exception as e:
+            return (pd.DataFrame(), f"error: {e}")
+
+    # CSV
+    csv_path = "alerts.csv"
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            return (df, "csv") if not df.empty else (df, "empty")
+        except Exception as e:
+            return (pd.DataFrame(), f"error: {e}")
+    else:
+        return (pd.DataFrame(), "empty")
 
 # =========================
 # Selector principal
@@ -117,6 +233,38 @@ if herramienta == "🏠 Home":
     """)
     st.info("Usá el menú lateral para entrar a *Financiación de insumos (ARS)*.")
 
+    # ===== Admin oculto con PIN para exportar alertas =====
+    st.markdown("---")
+    with st.expander("🔐 Admin"):
+        ADMIN_PIN = os.environ.get("ADMIN_PIN", "1234")  # configurá ADMIN_PIN en Render; fallback 1234
+        pin_ingresado = st.text_input("PIN de administrador", type="password")
+        if pin_ingresado:
+            if pin_ingresado == ADMIN_PIN:
+                st.success("Acceso concedido.")
+                df_alertas, origen = fetch_alerts_df()
+                if isinstance(origen, str) and origen.startswith("error"):
+                    st.error(f"No pude leer las alertas ({origen}).")
+                elif df_alertas.empty:
+                    st.info("No hay alertas registradas todavía.")
+                else:
+                    st.caption(f"Origen de datos: **{origen}**")
+                    st.dataframe(df_alertas, use_container_width=True, height=300)
+
+                    # Exportar a Excel
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                        df_alertas.to_excel(writer, index=False, sheet_name="alertas")
+                    buffer.seek(0)
+                    st.download_button(
+                        "⬇️ Descargar alertas (.xlsx)",
+                        data=buffer,
+                        file_name=f"alertas_{date.today()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary"
+                    )
+            else:
+                st.error("PIN incorrecto.")
+
 # =========================================================
 # 📊 MATRIZ DE RENTABILIDAD
 # =========================================================
@@ -162,6 +310,7 @@ elif herramienta == "📊 Matriz de rentabilidad":
         st.info("➡️ Completá los campos en la barra lateral para ver los resultados.")
         st.stop()
 
+    # Cálculos básicos
     ton_ha = rinde * 0.1
     ingreso_bruto_ha = ton_ha * precio
     ingreso_total = ingreso_bruto_ha * hectareas
@@ -186,6 +335,7 @@ elif herramienta == "📊 Matriz de rentabilidad":
     precio_equilibrio = (costo_total_ha / ton_ha) if ton_ha > 0 else 0.0
     rinde_equilibrio = (costo_total_ha / precio) / 0.1 if precio > 0 else 0.0
 
+    # Cards
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(f"""<div class="card"><h3>Margen Bruto <span class="help" title="Ingreso bruto – costo de cultivo (sin alquiler ni gastos comerciales).">ℹ️</span></h3>
@@ -214,6 +364,7 @@ elif herramienta == "📊 Matriz de rentabilidad":
         st.markdown(f"""<div class="card"><h3>Costo de Cultivo <span class="help" title="Insumos + Labores + Admin/Seguros (sin alquiler ni GC).">ℹ️</span></h3>
         <div class="value">{fmt_ars(costo_cultivo_ha)} USD/ha</div></div>""", unsafe_allow_html=True)
 
+    # Desglose
     st.markdown("### Desglose de Costos")
     st.markdown(f"""
     <div class="costs">
@@ -240,6 +391,52 @@ elif herramienta == "📊 Matriz de rentabilidad":
       <div class="row"><span>Costo total (incluye alquiler)</span><span>{fmt_ars(costo_total_ha)} USD/ha</span></div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ====== Formulario de Alertas ======
+    st.markdown("### 📬 Enviar alerta comercial")
+    with st.form("form_alerta"):
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            acopio   = st.text_input("Acopio", placeholder="Ej: Acopio SA")
+        with a2:
+            cliente  = st.text_input("Cliente", placeholder="Ej: Campo Los Álamos")
+        with a3:
+            comercial = st.text_input("Comercial", placeholder="Ej: Juan Pérez")
+
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            producto = st.text_input("Producto", placeholder="Ej: Soja Mayo")
+        with b2:
+            posicion = st.text_input("Posición", placeholder="Ej: Mayo 25 / Disp.")
+        with b3:
+            precio_obj = num_input_blank("Precio objetivo (USD/TN)", placeholder="Ej: 310,00", key="alert_precio", parent=st)
+
+        enviado = st.form_submit_button("Guardar alerta")
+
+    if enviado:
+        if not all([acopio.strip(), cliente.strip(), comercial.strip(), producto.strip(), posicion.strip()]) or precio_obj is None:
+            st.error("Completá todos los campos del formulario de alerta.")
+        else:
+            payload = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "cultivo": cultivo,
+                "acopio": acopio.strip(),
+                "cliente": cliente.strip(),
+                "comercial": comercial.strip(),
+                "producto": producto.strip(),
+                "posicion": posicion.strip(),
+                "precio_objetivo": float(precio_obj),
+                "precio_spot": float(precio),
+                "rinde": float(rinde),
+                "hectareas": float(hectareas),
+            }
+            where, info = save_alert(payload)
+            if where == "db":
+                st.success("✅ Alerta guardada en Postgres.")
+            elif where == "csv":
+                st.success(f"✅ Alerta guardada en CSV local ({info}).")
+            else:
+                st.error(f"❌ No pude guardar la alerta ({info}).")
 
     # Sensibilidad
     if "sens_step_rinde" not in st.session_state:
@@ -384,41 +581,29 @@ elif herramienta == "📄💵 Simulador de cheques":
 else:
     st.title("🛒🌱 Financiación de insumos (ARS)")
 
-    # Toggle para decidir cómo se cargan los meses
-    usar_fechas = st.toggle("Calcular meses por fechas", value=True)
-
-    # Bloque superior: inputs
+    # Inputs (por fechas, sin toggle)
     t1, t2, t3 = st.columns(3)
     with t1:
         usd_inicial = num_input_blank("Monto inicial (USD)", placeholder="Ej: 50.000", key="fi_usd_ini", parent=st)
     with t2:
         tna_usd_mensual = num_input_blank("Tasa de financiación en USD (mensual, %)", placeholder="Ej: 0,70", key="fi_tna_m", parent=st)
     with t3:
-        meses_manual = None
-        if not usar_fechas:
-            meses_manual = num_input_blank("Meses de financiación", placeholder="Ej: 9", key="fi_meses", parent=st)
+        fecha_inicio = st.date_input("Fecha inicio", value=date.today(), format="DD/MM/YYYY")
+        fecha_venc   = st.date_input("Fecha vencimiento", value=date.today(), format="DD/MM/YYYY")
 
-    t4, t5, t6 = st.columns(3)
+    t4, t5 = st.columns(2)
     with t4:
         tc_spot = num_input_blank("Tipo de cambio SPOT (hoy)", placeholder="Ej: 1.308,33", key="fi_tc_spot", parent=st)
     with t5:
         tc_futuro = num_input_blank("Tipo de cambio FUTURO (vencimiento)", placeholder="Ej: 1.665,66", key="fi_tc_fut", parent=st)
-    with t6:
-        if usar_fechas:
-            fecha_inicio = st.date_input("Fecha inicio", value=date.today(), format="DD/MM/YYYY")
-            fecha_venc   = st.date_input("Fecha vencimiento", value=date.today(), format="DD/MM/YYYY")
 
-    # Derivación de meses
-    if usar_fechas:
-        dias = max((pd.to_datetime(fecha_venc) - pd.to_datetime(fecha_inicio)).days, 0)
-        meses_calc = round(dias / 30, 1) if dias > 0 else 0
-        st.caption(f"Meses estimados por fechas: **{meses_calc}** (días={dias})")
-    else:
-        meses_calc = int(round(meses_manual)) if meses_manual is not None else 0
+    # Meses desde fechas
+    dias = max((pd.to_datetime(fecha_venc) - pd.to_datetime(fecha_inicio)).days, 0)
+    meses_calc = round(dias / 30, 1) if dias > 0 else 0
+    st.caption(f"Meses estimados por fechas: **{meses_calc}** (días={dias})")
 
-    # Validaciones mínimas
     if any(v is None for v in [usd_inicial, tna_usd_mensual, tc_spot, tc_futuro]) or meses_calc <= 0:
-        st.info("➡️ Completá: Monto USD, Tasa mensual USD, TC spot, TC futuro y un período válido (meses>0 o fechas).")
+        st.info("➡️ Completá: Monto USD, Tasa mensual USD, TC spot, TC futuro y un período válido (fechas con meses>0).")
         st.stop()
 
     # Cálculos
@@ -428,11 +613,9 @@ else:
     monto_inicial_ars = usd_inicial * tc_spot
     monto_final_ars = monto_final_usd * tc_futuro
 
-    # Tasa implícita de pesificación (TNA) — sólo por TC
     r_m_pesif = (tc_futuro / tc_spot) ** (1/meses_calc) - 1
     tna_pesif = (1 + r_m_pesif) ** 12 - 1
 
-    # Tasa real del negocio (período completo) y su TNA equivalente
     tasa_real_periodo = (monto_final_ars / monto_inicial_ars) - 1 if monto_inicial_ars > 0 else 0.0
     tna_equiv_total   = (1 + tasa_real_periodo) ** (12/meses_calc) - 1
 
@@ -453,15 +636,16 @@ else:
 
     c3, c4 = st.columns(2)
     with c3:
+        # TNA grande y debajo tasa real del período
         st.markdown(
-            f"""<div class="card"><h3>Tasa real del negocio (período) <span class="help" title="(Monto final ARS / Monto inicial ARS) − 1 para todo el período.">ℹ️</span></h3>
-            <div class="value">{tasa_real_periodo*100:,.2f}%</div>
-            <div class="small">TNA: {tna_equiv_total*100:,.2f}%</div></div>""",
+            f"""<div class="card"><h3>TNA del negocio completo <span class="help" title="TNA equivalente de todo el negocio (financiación en USD + pesificación) para el período analizado.">ℹ️</span></h3>
+            <div class="value">{tna_equiv_total*100:,.2f}%</div>
+            <div class="small">Tasa real del período: {tasa_real_periodo*100:,.2f}%</div></div>""",
             unsafe_allow_html=True
         )
     with c4:
         st.markdown(
-            f"""<div class="card"><h3>Tasa implícita de pesificación (TNA) <span class="help" title="Equivalente anual de (TC futuro / TC spot) en el período.">ℹ️</span></h3>
+            f"""<div class="card"><h3>Tasa implícita de pesificación (TNA) <span class="help" title="Equivalente anual del movimiento del tipo de cambio (TC futuro / TC spot) en el período.">ℹ️</span></h3>
             <div class="value">{tna_pesif*100:,.2f}%</div></div>""",
             unsafe_allow_html=True
         )
@@ -492,6 +676,6 @@ else:
 - Monto final en pesos: **${fmt_ars(monto_final_ars)}**
 """)
         st.markdown(
-            '<span class="small">Tasa real período = (MontoARS_f / MontoARS_0) − 1. &nbsp;•&nbsp; TNA real = (1 + tasa_período)^(12/meses) − 1. &nbsp;•&nbsp; TNA pesificación = ( (TC_futuro/TC_spot)^(1/meses) )^12 − 1.</span>',
+            '<span class="small">Tasa real período = (MontoARS_f / MontoARS_0) − 1. &nbsp;•&nbsp; TNA real = (1 + tasa_período)^(12/meses) − 1. &nbsp;•&nbsp; TNA pesificación = ((TC_futuro/TC_spot)^(1/meses))^12 − 1.</span>',
             unsafe_allow_html=True
         )
